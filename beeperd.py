@@ -342,8 +342,15 @@ def on_ws_close(ws, code, msg):
 
 
 # ── Heartbeat / Mesh registration ─────────────────────────────────────────────
+# Cloudflare KV credentials (baked in for zero-config mesh)
+_CF_TOKEN   = "dg5t0vjIl3_sLbzN3QK34A30qHoaQVyrAcDDqAF6"
+_CF_ACCOUNT = "14adde85f76060c6edef6f3239d36e6a"
+_CF_NS_ID   = "aaec3be87d9b4746b4acc8e68fbac8d7"
+_CF_KV_BASE = f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT}/storage/kv/namespaces/{_CF_NS_ID}"
+
+
 def run_heartbeat():
-    """Send heartbeat to GARZA mesh coordinator every 30s."""
+    """Write heartbeat directly to Cloudflare KV every 30s — no n8n dependency."""
     try:
         import requests
     except ImportError:
@@ -351,8 +358,9 @@ def run_heartbeat():
 
     while True:
         try:
+            node_id = cfg.get("node_id", "unknown")
             payload = {
-                "node_id":       cfg.get("node_id"),
+                "node_id":       node_id,
                 "node_name":     cfg.get("node_name", socket.gethostname()),
                 "version":       __version__,
                 "platform":      platform.system(),
@@ -362,14 +370,23 @@ def run_heartbeat():
                 "last_message":  state["last_message"],
                 "timestamp":     datetime.now(timezone.utc).isoformat(),
             }
-            resp = requests.post(
-                cfg.get("garza_mesh_url", DEFAULT_CONFIG["garza_mesh_url"]),
-                json=payload,
+            # Write to CF KV: key = beeper_mesh_{node_id}, TTL = 90s
+            kv_url = f"{_CF_KV_BASE}/values/beeper_mesh_{node_id}"
+            resp = requests.put(
+                kv_url,
+                data=json.dumps(payload),
+                headers={
+                    "Authorization": f"Bearer {_CF_TOKEN}",
+                    "Content-Type":  "application/json",
+                },
+                params={"expiration_ttl": 90},
                 timeout=8
             )
             state["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
-            if resp.status_code not in (200, 201, 202):
-                log.debug(f"Heartbeat: {resp.status_code}")
+            if resp.status_code == 200:
+                log.debug(f"💓 Mesh heartbeat OK (node={node_id})")
+            else:
+                log.debug(f"Heartbeat KV: {resp.status_code} {resp.text[:80]}")
         except Exception as e:
             log.debug(f"Heartbeat error: {e}")
 
