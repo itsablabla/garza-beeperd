@@ -73,15 +73,21 @@ if [ -z "$PYTHON" ]; then
     fi
 fi
 
-# ── pip check ─────────────────────────────────────────────────────────────────
-if ! "$PYTHON" -m pip --version &>/dev/null; then
-    warn "pip not found, installing..."
-    curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$PYTHON"
+# ── Create venv (avoids Homebrew externally-managed-environment error) ────────
+VENV_DIR="${INSTALL_DIR}/venv"
+if [ ! -d "${VENV_DIR}" ]; then
+    info "Creating Python virtual environment..."
+    "$PYTHON" -m venv "${VENV_DIR}"
+    success "Virtual environment created at ${VENV_DIR}"
 fi
 
-# ── Install Python dependencies ───────────────────────────────────────────────
+# Use the venv python/pip for everything
+VENV_PYTHON="${VENV_DIR}/bin/python"
+VENV_PIP="${VENV_DIR}/bin/pip"
+
+# ── Install Python dependencies into venv ─────────────────────────────────────
 info "Installing Python dependencies..."
-"$PYTHON" -m pip install --quiet --upgrade websocket-client requests
+"$VENV_PIP" install --quiet --upgrade websocket-client requests
 success "Dependencies installed"
 
 # ── Create install directory ──────────────────────────────────────────────────
@@ -100,10 +106,10 @@ fi
 chmod +x "${SCRIPT}"
 success "Downloaded to ${SCRIPT}"
 
-# ── Create beeperd wrapper in PATH ────────────────────────────────────────────
+# ── Create beeperd wrapper in PATH (uses venv python) ────────────────────────
 cat > "${BIN}" << EOF
 #!/usr/bin/env bash
-exec "${PYTHON}" "${SCRIPT}" "\$@"
+exec "${VENV_PYTHON}" "${SCRIPT}" "\$@"
 EOF
 chmod +x "${BIN}"
 
@@ -149,11 +155,11 @@ echo -e "  ${BLUE}beeperd logs${RESET}"
 echo ""
 
 # ── Auto-run setup if interactive ─────────────────────────────────────────────
-if [ -t 0 ]; then
+    if [ -t 0 ]; then
     echo -e "${YELLOW}Run setup wizard now? (Y/n):${RESET} \c"
     read -r ANSWER
     if [ "${ANSWER:-y}" != "n" ] && [ "${ANSWER:-y}" != "N" ]; then
         echo ""
-        "${PYTHON}" "${SCRIPT}" setup
+        "${VENV_PYTHON}" "${SCRIPT}" setup
     fi
 fi
