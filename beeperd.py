@@ -2,21 +2,22 @@
 """
 garza-beeperd — GARZA Beeper Relay Daemon
 ==========================================
-A resilient, auto-updating, mesh-aware daemon that:
-  • Connects to local Beeper Desktop API WebSocket
-  • Forwards every message to GARZA Comm Center in real-time (<2s)
-  • Registers itself in the mesh (Cloudflare KV) for failover
-  • Exposes health API on port 7373
+A resilient, auto-updating, Tailscale-aware mesh daemon that:
+  • Connects to local Beeper Desktop API WebSocket (<2s latency)
+  • Forwards every message to GARZA Comm Center in real-time
+  • Auto-detects Tailscale IP and registers in mesh (Cloudflare KV)
+  • Peers discover each other via KV — mesh survives node failures
+  • Exposes health API on port 7373 (reachable over Tailscale)
   • Auto-updates from GitHub every 24 hours
   • Auto-restarts via LaunchAgent (Mac) or systemd (Linux)
 
-Version: 1.0.0
+Version: 1.1.0
 GitHub:  https://github.com/itsablabla/garza-beeperd
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 GITHUB_REPO = "itsablabla/garza-beeperd"
-GITHUB_RAW   = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/beeperd.py"
+GITHUB_RAW  = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/beeperd.py"
 
 import os, sys, json, time, logging, threading, socket, hashlib, platform
 import subprocess, signal, argparse
@@ -24,26 +25,23 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # ── Paths & Config ────────────────────────────────────────────────────────────
-CONFIG_DIR  = Path.home() / ".garza" / "beeperd"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-LOG_FILE    = CONFIG_DIR / "beeperd.log"
-PID_FILE    = CONFIG_DIR / "beeperd.pid"
-VERSION_FILE= CONFIG_DIR / "version"
+CONFIG_DIR   = Path.home() / ".garza" / "beeperd"
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+LOG_FILE     = CONFIG_DIR / "beeperd.log"
+PID_FILE     = CONFIG_DIR / "beeperd.pid"
 
-BEEPER_WS   = "ws://localhost:23373/v1/ws"
-BEEPER_HTTP = "http://localhost:23373"
-HEALTH_PORT = 7373
+BEEPER_WS    = "ws://localhost:23373/v1/ws"
+BEEPER_HTTP  = "http://localhost:23373"
+HEALTH_PORT  = 7373
 
-# Defaults (overridden by config)
 DEFAULT_CONFIG = {
     "garza_ingest_url": "https://primary-production-f10f7.up.railway.app/webhook/comm-center-ingest",
-    "garza_mesh_url":   "https://primary-production-f10f7.up.railway.app/webhook/beeper-mesh",
     "beeper_token":     "",
     "node_id":          "",
     "node_name":        socket.gethostname(),
     "auto_update":      True,
-    "update_interval":  86400,   # 24 hours
-    "heartbeat_interval": 30,    # seconds
+    "update_interval":  86400,
+    "heartbeat_interval": 30,
     "vip_senders": [
         "jessica", "jessica garza", "jess",
         "eric", "eric schuele",
@@ -53,19 +51,25 @@ DEFAULT_CONFIG = {
 }
 
 PLATFORM_MAP = {
-    "telegram":   "Telegram",
-    "whatsapp":   "WhatsApp",
-    "imessage":   "iMessage",
-    "slack":      "Slack",
-    "signal":     "Signal",
-    "instagram":  "Instagram",
-    "twitter":    "Twitter/X",
-    "linkedin":   "LinkedIn",
-    "discord":    "Discord",
-    "messenger":  "Messenger",
-    "sms":        "SMS",
-    "matrix":     "Matrix",
+    "telegram":  "Telegram",
+    "whatsapp":  "WhatsApp",
+    "imessage":  "iMessage",
+    "slack":     "Slack",
+    "signal":    "Signal",
+    "instagram": "Instagram",
+    "twitter":   "Twitter/X",
+    "linkedin":  "LinkedIn",
+    "discord":   "Discord",
+    "messenger": "Messenger",
+    "sms":       "SMS",
+    "matrix":    "Matrix",
 }
+
+# Cloudflare KV — baked in for zero-config mesh
+_CF_TOKEN   = "dg5t0vjIl3_sLbzN3QK34A30qHoaQVyrAcDDqAF6"
+_CF_ACCOUNT = "14adde85f76060c6edef6f3239d36e6a"
+_CF_NS_ID   = "aaec3be87d9b4746b4acc8e68fbac8d7"
+_CF_KV_BASE = f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT}/storage/kv/namespaces/{_CF_NS_ID}"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -90,6 +94,8 @@ state = {
     "version":       __version__,
     "node_name":     socket.gethostname(),
     "platform":      platform.system(),
+    "tailscale_ip":  None,
+    "mesh_peers":    [],
 }
 
 cfg = {}
@@ -109,10 +115,9 @@ def load_config() -> dict:
             cfg = DEFAULT_CONFIG.copy()
     else:
         cfg = DEFAULT_CONFIG.copy()
-    # Generate node_id if missing
     if not cfg.get("node_id"):
         cfg["node_id"] = hashlib.sha256(
-            f"{socket.gethostname()}{platform.node()}{os.getpid()}".encode()
+            f"{socket.gethostname()}{platform.node()}".encode()
         ).hexdigest()[:12]
         save_config()
     return cfg
@@ -122,6 +127,94 @@ def save_config():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+# ── Tailscale IP detection ────────────────────────────────────────────────────
+def get_tailscale_ip() -> str | None:
+    """
+    Detect the node's Tailscale IP (100.x.x.x) using multiple methods:
+    1. tailscale ip -4 command
+    2. Parse tailscale status --json
+    3. Scan network interfaces for 100.x.x.x addresses
+    Returns None if Tailscale is not running.
+    """
+    # Method 1: tailscale CLI
+    for cmd in [["tailscale", "ip", "-4"], ["/usr/local/bin/tailscale", "ip", "-4"],
+                ["/usr/bin/tailscale", "ip", "-4"]]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                ip = result.stdout.strip()
+                if ip.startswith("100."):
+                    log.info(f"🔷 Tailscale IP: {ip} (via CLI)")
+                    return ip
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # Method 2: tailscale status --json
+    for cmd in [["tailscale", "status", "--json"], ["/usr/local/bin/tailscale", "status", "--json"]]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                self_node = data.get("Self", {})
+                ips = self_node.get("TailscaleIPs", [])
+                for ip in ips:
+                    if ip.startswith("100."):
+                        log.info(f"🔷 Tailscale IP: {ip} (via status)")
+                        return ip
+        except Exception:
+            pass
+
+    # Method 3: Scan network interfaces for 100.x.x.x
+    try:
+        import socket as sock
+        for iface_info in sock.getaddrinfo(sock.gethostname(), None):
+            ip = iface_info[4][0]
+            if ip.startswith("100."):
+                log.info(f"🔷 Tailscale IP: {ip} (via interfaces)")
+                return ip
+    except Exception:
+        pass
+
+    # Method 4: Check /proc/net/if_inet6 or ip addr on Linux
+    if platform.system() == "Linux":
+        try:
+            result = subprocess.run(["ip", "addr", "show"], capture_output=True, text=True, timeout=5)
+            import re
+            matches = re.findall(r'inet (100\.\d+\.\d+\.\d+)', result.stdout)
+            if matches:
+                log.info(f"🔷 Tailscale IP: {matches[0]} (via ip addr)")
+                return matches[0]
+        except Exception:
+            pass
+
+    log.debug("Tailscale not detected on this node")
+    return None
+
+
+def get_tailscale_peers() -> list[dict]:
+    """Get all online Tailscale peers from tailscale status."""
+    peers = []
+    for cmd in [["tailscale", "status", "--json"], ["/usr/local/bin/tailscale", "status", "--json"]]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                for peer_key, peer in data.get("Peer", {}).items():
+                    ips = peer.get("TailscaleIPs", [])
+                    v4_ip = next((ip for ip in ips if "." in ip), None)
+                    if v4_ip and peer.get("Online", False):
+                        peers.append({
+                            "hostname": peer.get("HostName", peer_key[:8]),
+                            "ip":       v4_ip,
+                            "os":       peer.get("OS", "unknown"),
+                            "online":   peer.get("Online", False),
+                        })
+            return peers
+        except Exception:
+            pass
+    return peers
 
 
 # ── VIP check ─────────────────────────────────────────────────────────────────
@@ -157,7 +250,6 @@ def process_message_event(event: dict):
         entry = event.get("message") or event.get("entry")
         if entry:
             entries = [entry]
-
     if not entries:
         return
 
@@ -171,30 +263,24 @@ def process_message_event(event: dict):
             str(time.time())
         )
 
-        # Dedup
         if msg_id in seen_ids:
             continue
         seen_ids.add(msg_id)
         if len(seen_ids) > 10000:
-            # Trim oldest 5000
             seen_ids.difference_update(list(seen_ids)[:5000])
 
-        # Skip outgoing
         if entry.get("isOutgoing") or entry.get("outgoing"):
             continue
 
-        # Get sender
         sender = (
             entry.get("senderName") or entry.get("sender") or
             entry.get("from") or entry.get("author") or ""
         )
 
-        # Get body
         body = entry.get("text") or entry.get("body") or entry.get("content") or ""
         if isinstance(body, dict):
             body = body.get("text") or body.get("body") or str(body)
 
-        # Handle attachments
         if not body or not body.strip():
             attachments = entry.get("attachments") or []
             if attachments:
@@ -202,12 +288,10 @@ def process_message_event(event: dict):
             else:
                 continue
 
-        # Chat info
         chat_id   = entry.get("chatID") or entry.get("roomID") or event.get("chatID") or ""
         chat_name = entry.get("chatName") or entry.get("roomName") or chat_id
         platform_name = detect_platform(chat_id)
 
-        # Timestamp
         ts = entry.get("timestamp") or entry.get("ts") or event.get("ts", 0)
         if isinstance(ts, (int, float)) and ts > 1e10:
             ts = ts / 1000
@@ -217,17 +301,18 @@ def process_message_event(event: dict):
         )
 
         payload = {
-            "source":    "beeper",
-            "platform":  platform_name,
-            "messageId": f"beeper_{msg_id}",
-            "from":      sender or "Unknown",
-            "subject":   f"[{platform_name}] {chat_name}" if chat_name else f"[{platform_name}] Message",
-            "body":      body.strip()[:2000],
-            "timestamp": msg_time,
-            "chatId":    chat_id,
-            "isVip":     is_vip(sender),
-            "node_id":   cfg.get("node_id", ""),
-            "node_name": cfg.get("node_name", socket.gethostname()),
+            "source":       "beeper",
+            "platform":     platform_name,
+            "messageId":    f"beeper_{msg_id}",
+            "from":         sender or "Unknown",
+            "subject":      f"[{platform_name}] {chat_name}" if chat_name else f"[{platform_name}] Message",
+            "body":         body.strip()[:2000],
+            "timestamp":    msg_time,
+            "chatId":       chat_id,
+            "isVip":        is_vip(sender),
+            "node_id":      cfg.get("node_id", ""),
+            "node_name":    cfg.get("node_name", socket.gethostname()),
+            "tailscale_ip": state.get("tailscale_ip"),
         }
 
         log.info(f"📨 [{platform_name}] {sender}: {body[:80]}")
@@ -255,11 +340,10 @@ def process_message_event(event: dict):
 
 # ── WebSocket watcher ─────────────────────────────────────────────────────────
 def run_watcher():
-    """Main WebSocket watcher loop with exponential backoff reconnect."""
     try:
         import websocket
     except ImportError:
-        log.error("websocket-client not installed. Run: pip3 install websocket-client")
+        log.error("websocket-client not installed")
         sys.exit(1)
 
     delay = 5
@@ -268,7 +352,7 @@ def run_watcher():
     while True:
         token = cfg.get("beeper_token", "")
         if not token:
-            log.error("No Beeper token configured. Run: beeperd setup")
+            log.error("No Beeper token. Run: beeperd setup")
             time.sleep(30)
             load_config()
             continue
@@ -342,19 +426,24 @@ def on_ws_close(ws, code, msg):
 
 
 # ── Heartbeat / Mesh registration ─────────────────────────────────────────────
-# Cloudflare KV credentials (baked in for zero-config mesh)
-_CF_TOKEN   = "dg5t0vjIl3_sLbzN3QK34A30qHoaQVyrAcDDqAF6"
-_CF_ACCOUNT = "14adde85f76060c6edef6f3239d36e6a"
-_CF_NS_ID   = "aaec3be87d9b4746b4acc8e68fbac8d7"
-_CF_KV_BASE = f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT}/storage/kv/namespaces/{_CF_NS_ID}"
-
-
 def run_heartbeat():
-    """Write heartbeat directly to Cloudflare KV every 30s — no n8n dependency."""
+    """
+    Write heartbeat to Cloudflare KV every 30s.
+    Includes Tailscale IP so peers can reach this node directly.
+    Also reads all other mesh nodes from KV to populate state['mesh_peers'].
+    """
     try:
         import requests
     except ImportError:
         return
+
+    # Detect Tailscale IP once at startup
+    ts_ip = get_tailscale_ip()
+    state["tailscale_ip"] = ts_ip
+    if ts_ip:
+        log.info(f"🔷 Registered on Tailscale mesh: {ts_ip}")
+    else:
+        log.info("ℹ️  Tailscale not detected — mesh will use public ingest only")
 
     while True:
         try:
@@ -368,9 +457,11 @@ def run_heartbeat():
                 "messages_sent": state["messages_sent"],
                 "started_at":    state["started_at"],
                 "last_message":  state["last_message"],
+                "tailscale_ip":  ts_ip,
                 "timestamp":     datetime.now(timezone.utc).isoformat(),
             }
-            # Write to CF KV: key = beeper_mesh_{node_id}, TTL = 90s
+
+            # Write this node's heartbeat to KV (TTL=90s — if silent for 90s, auto-expires)
             kv_url = f"{_CF_KV_BASE}/values/beeper_mesh_{node_id}"
             resp = requests.put(
                 kv_url,
@@ -384,37 +475,81 @@ def run_heartbeat():
             )
             state["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
             if resp.status_code == 200:
-                log.debug(f"💓 Mesh heartbeat OK (node={node_id})")
+                log.debug(f"💓 Heartbeat OK (node={node_id}, ts={ts_ip or 'none'})")
             else:
-                log.debug(f"Heartbeat KV: {resp.status_code} {resp.text[:80]}")
+                log.debug(f"Heartbeat KV: {resp.status_code}")
+
+            # Read all mesh peers from KV
+            _refresh_mesh_peers(requests)
+
         except Exception as e:
             log.debug(f"Heartbeat error: {e}")
 
         time.sleep(cfg.get("heartbeat_interval", 30))
 
 
-# ── Auto-updater ──────────────────────────────────────────────────────────────
-def check_for_update() -> bool:
-    """Check GitHub for a newer version and self-update if available."""
+def _refresh_mesh_peers(requests_mod):
+    """Read all beeper_mesh_* keys from KV and update state['mesh_peers']."""
     try:
-        import requests
-        resp = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-            timeout=10,
-            headers={"Accept": "application/vnd.github.v3+json"}
+        list_url = f"{_CF_KV_BASE}/keys"
+        resp = requests_mod.get(
+            list_url,
+            headers={"Authorization": f"Bearer {_CF_TOKEN}"},
+            params={"prefix": "beeper_mesh_"},
+            timeout=8
         )
         if resp.status_code != 200:
-            # Fall back to raw version file
-            vresp = requests.get(
-                f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/VERSION",
-                timeout=10
-            )
-            if vresp.status_code != 200:
-                return False
-            latest = vresp.text.strip()
-        else:
-            latest = resp.json().get("tag_name", "").lstrip("v")
+            return
 
+        keys = [k["name"] for k in resp.json().get("result", [])]
+        peers = []
+        my_node_id = cfg.get("node_id", "")
+
+        for key in keys:
+            node_id = key.replace("beeper_mesh_", "")
+            if node_id == my_node_id:
+                continue  # Skip self
+            try:
+                val_resp = requests_mod.get(
+                    f"{_CF_KV_BASE}/values/{key}",
+                    headers={"Authorization": f"Bearer {_CF_TOKEN}"},
+                    timeout=5
+                )
+                if val_resp.status_code == 200:
+                    peer_data = val_resp.json()
+                    peers.append({
+                        "node_id":      node_id,
+                        "node_name":    peer_data.get("node_name", node_id),
+                        "tailscale_ip": peer_data.get("tailscale_ip"),
+                        "version":      peer_data.get("version", "?"),
+                        "ws_connected": peer_data.get("ws_connected", False),
+                        "platform":     peer_data.get("platform", "?"),
+                        "last_seen":    peer_data.get("timestamp"),
+                        "messages_sent": peer_data.get("messages_sent", 0),
+                    })
+            except Exception:
+                pass
+
+        state["mesh_peers"] = peers
+        if peers:
+            peer_names = [f"{p['node_name']} ({p['tailscale_ip'] or 'no-ts'})" for p in peers]
+            log.debug(f"🕸️  Mesh peers: {', '.join(peer_names)}")
+
+    except Exception as e:
+        log.debug(f"Mesh peer refresh error: {e}")
+
+
+# ── Auto-updater ──────────────────────────────────────────────────────────────
+def check_for_update() -> bool:
+    try:
+        import requests
+        vresp = requests.get(
+            f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/VERSION",
+            timeout=10
+        )
+        if vresp.status_code != 200:
+            return False
+        latest = vresp.text.strip()
         if not latest:
             return False
 
@@ -426,18 +561,13 @@ def check_for_update() -> bool:
             return False
 
         log.info(f"🆕 Update available: v{__version__} → v{latest}")
-
-        # Download new version
         new_script = requests.get(GITHUB_RAW, timeout=30).text
         script_path = Path(__file__).resolve()
         backup_path = script_path.with_suffix(".py.bak")
-
-        # Backup current
         script_path.rename(backup_path)
         try:
             script_path.write_text(new_script)
             log.info(f"✅ Updated to v{latest} — restarting...")
-            # Restart self
             os.execv(sys.executable, [sys.executable, str(script_path)] + sys.argv[1:])
         except Exception as e:
             log.error(f"Update failed: {e} — restoring backup")
@@ -450,9 +580,7 @@ def check_for_update() -> bool:
 
 
 def run_auto_updater():
-    """Check for updates every 24 hours."""
-    # Wait 5 minutes before first check
-    time.sleep(300)
+    time.sleep(300)  # Wait 5 min before first check
     while True:
         if cfg.get("auto_update", True):
             check_for_update()
@@ -461,21 +589,25 @@ def run_auto_updater():
 
 # ── Health API ────────────────────────────────────────────────────────────────
 def run_health_api():
-    """Simple HTTP health API on port 7373."""
+    """
+    HTTP health API on port 7373.
+    Binds to 0.0.0.0 so it's reachable over Tailscale from other mesh nodes.
+    """
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            pass  # Suppress access logs
+            pass
 
         def do_GET(self):
             if self.path in ("/", "/health", "/status"):
                 body = json.dumps({
                     **state,
                     "config": {
-                        "node_id":   cfg.get("node_id"),
-                        "node_name": cfg.get("node_name"),
-                        "auto_update": cfg.get("auto_update"),
+                        "node_id":      cfg.get("node_id"),
+                        "node_name":    cfg.get("node_name"),
+                        "auto_update":  cfg.get("auto_update"),
+                        "tailscale_ip": state.get("tailscale_ip"),
                     }
                 }, indent=2).encode()
                 self.send_response(200)
@@ -487,13 +619,29 @@ def run_health_api():
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"pong")
+            elif self.path == "/mesh":
+                # Return mesh peers for dashboard
+                body = json.dumps({
+                    "node_id":      cfg.get("node_id"),
+                    "node_name":    cfg.get("node_name"),
+                    "tailscale_ip": state.get("tailscale_ip"),
+                    "peers":        state.get("mesh_peers", []),
+                }, indent=2).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", len(body))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self.send_response(404)
                 self.end_headers()
 
     try:
         server = HTTPServer(("0.0.0.0", HEALTH_PORT), Handler)
-        log.info(f"🌐 Health API listening on http://0.0.0.0:{HEALTH_PORT}")
+        log.info(f"🌐 Health API: http://localhost:{HEALTH_PORT}/status")
+        ts_ip = state.get("tailscale_ip")
+        if ts_ip:
+            log.info(f"🔷 Reachable over Tailscale: http://{ts_ip}:{HEALTH_PORT}/status")
         server.serve_forever()
     except OSError as e:
         log.warning(f"Health API could not start on port {HEALTH_PORT}: {e}")
@@ -509,6 +657,17 @@ def setup_wizard():
     print("This daemon connects to Beeper Desktop and pushes every")
     print("message to your GARZA Comm Center in under 2 seconds.")
     print()
+
+    # Detect Tailscale before setup
+    ts_ip = get_tailscale_ip()
+    if ts_ip:
+        print(f"🔷 Tailscale detected: {ts_ip}")
+        print("   This node will be registered in the mesh with its Tailscale IP.")
+    else:
+        print("ℹ️  Tailscale not detected. Install Tailscale for mesh networking.")
+        print("   https://tailscale.com/download")
+    print()
+
     print("STEP 1 — Enable Beeper Desktop API:")
     print("  Open Beeper → Settings → Developers")
     print("  Toggle 'Beeper Desktop API' ON")
@@ -521,7 +680,7 @@ def setup_wizard():
         sys.exit(1)
 
     # Test token
-    print("\nTesting connection...")
+    print("\nTesting connection to Beeper Desktop API...")
     try:
         import requests
         r = requests.get(
@@ -543,22 +702,24 @@ def setup_wizard():
 
     load_config()
     cfg["beeper_token"] = token
-    cfg["node_name"] = input(f"\nSTEP 3 — Node name (default: {socket.gethostname()}):\n> ").strip() or socket.gethostname()
+    default_name = socket.gethostname()
+    cfg["node_name"] = input(f"\nSTEP 3 — Node name (default: {default_name}):\n> ").strip() or default_name
     save_config()
 
     print()
     print("✅ Config saved to", CONFIG_FILE)
     print()
 
-    # Install auto-start
     install = input("Install auto-start service? (Y/n): ").strip().lower()
     if install != "n":
         install_service()
 
     print()
     print("🚀 Starting garza-beeperd...")
-    print(f"   Logs: {LOG_FILE}")
+    print(f"   Logs:   {LOG_FILE}")
     print(f"   Health: http://localhost:{HEALTH_PORT}/status")
+    if ts_ip:
+        print(f"   Mesh:   http://{ts_ip}:{HEALTH_PORT}/mesh")
     print()
     run_daemon()
 
@@ -574,7 +735,7 @@ def install_service():
     elif system == "Linux":
         _install_systemd(python_path, script_path)
     else:
-        log.warning(f"Auto-start not supported on {system}. Run manually: python3 {script_path} run")
+        log.warning(f"Auto-start not supported on {system}.")
 
 
 def _install_launchagent(python_path: str, script_path: str):
@@ -606,18 +767,21 @@ def _install_launchagent(python_path: str, script_path: str):
     <integer>5</integer>
     <key>WorkingDirectory</key>
     <string>{Path.home()}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
 </dict>
 </plist>
 """
     plist_path.write_text(plist)
-
-    # Unload first if already loaded
     subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
     result = subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True, text=True)
 
     if result.returncode == 0:
         log.info(f"✅ LaunchAgent installed: {plist_path}")
-        log.info("🚀 Will auto-start on login and restart if it crashes")
+        log.info("🚀 Auto-starts on login, restarts if it crashes")
     else:
         log.warning(f"LaunchAgent load warning: {result.stderr}")
         log.info(f"Manual load: launchctl load -w {plist_path}")
@@ -626,7 +790,7 @@ def _install_launchagent(python_path: str, script_path: str):
 def _install_systemd(python_path: str, script_path: str):
     service = f"""[Unit]
 Description=GARZA Beeper Relay Daemon
-After=network.target
+After=network.target tailscaled.service
 Wants=network-online.target
 
 [Service]
@@ -637,6 +801,7 @@ RestartSec=5
 StandardOutput=append:{LOG_FILE}
 StandardError=append:{LOG_FILE}
 Environment=HOME={Path.home()}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -647,36 +812,35 @@ WantedBy=default.target
     service_path.write_text(service)
 
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-    result = subprocess.run(["systemctl", "--user", "enable", "--now", "garza-beeperd"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["systemctl", "--user", "enable", "--now", "garza-beeperd"],
+        capture_output=True, text=True
+    )
 
     if result.returncode == 0:
-        log.info(f"✅ systemd service installed and started")
-        log.info("   systemctl --user status garza-beeperd")
+        log.info("✅ systemd service installed and started")
     else:
         log.warning(f"systemd install warning: {result.stderr}")
-        log.info(f"Manual: systemctl --user enable --now garza-beeperd")
+        log.info("Manual: systemctl --user enable --now garza-beeperd")
 
 
 # ── Main daemon runner ────────────────────────────────────────────────────────
 def run_daemon():
-    """Start all daemon threads."""
     log.info(f"🚀 garza-beeperd v{__version__} starting on {socket.gethostname()}")
-    log.info(f"   Node ID: {cfg.get('node_id')}")
-    log.info(f"   Ingest:  {cfg.get('garza_ingest_url')}")
-    log.info(f"   Health:  http://localhost:{HEALTH_PORT}/status")
+    log.info(f"   Node ID:  {cfg.get('node_id')}")
+    log.info(f"   Ingest:   {cfg.get('garza_ingest_url')}")
+    log.info(f"   Health:   http://localhost:{HEALTH_PORT}/status")
 
-    # Write PID
     PID_FILE.write_text(str(os.getpid()))
 
     threads = [
-        threading.Thread(target=run_health_api,    daemon=True, name="health"),
-        threading.Thread(target=run_heartbeat,     daemon=True, name="heartbeat"),
-        threading.Thread(target=run_auto_updater,  daemon=True, name="updater"),
+        threading.Thread(target=run_health_api,   daemon=True, name="health"),
+        threading.Thread(target=run_heartbeat,    daemon=True, name="heartbeat"),
+        threading.Thread(target=run_auto_updater, daemon=True, name="updater"),
     ]
     for t in threads:
         t.start()
 
-    # Watcher runs in main thread (blocking)
     run_watcher()
 
 
@@ -684,17 +848,18 @@ def run_daemon():
 def main():
     parser = argparse.ArgumentParser(
         prog="beeperd",
-        description="GARZA Beeper Relay Daemon — resilient, auto-updating, mesh-aware"
+        description="GARZA Beeper Relay Daemon — resilient, Tailscale-aware, auto-updating"
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("run",     help="Start the daemon (foreground)")
-    sub.add_parser("setup",   help="Interactive setup wizard")
-    sub.add_parser("install", help="Install auto-start service only")
-    sub.add_parser("update",  help="Check for and apply updates now")
-    sub.add_parser("status",  help="Show daemon status")
-    sub.add_parser("logs",    help="Tail daemon logs")
-    sub.add_parser("stop",    help="Stop the daemon")
+    sub.add_parser("run",       help="Start the daemon (foreground)")
+    sub.add_parser("setup",     help="Interactive setup wizard")
+    sub.add_parser("install",   help="Install auto-start service only")
+    sub.add_parser("update",    help="Check for and apply updates now")
+    sub.add_parser("status",    help="Show daemon status")
+    sub.add_parser("logs",      help="Tail daemon logs")
+    sub.add_parser("stop",      help="Stop the daemon")
+    sub.add_parser("mesh",      help="Show mesh peer status")
     sub.add_parser("uninstall", help="Remove auto-start service")
 
     args = parser.parse_args()
@@ -723,27 +888,58 @@ def main():
             import requests
             r = requests.get(f"http://localhost:{HEALTH_PORT}/status", timeout=3)
             s = r.json()
-            print(f"\n{'─'*50}")
+            ts_ip = s.get("config", {}).get("tailscale_ip") or s.get("tailscale_ip")
+            print(f"\n{'─'*54}")
             print(f"  garza-beeperd v{s.get('version','?')}")
-            print(f"  Node:      {s.get('node_name','?')} ({s.get('config',{}).get('node_id','?')})")
-            print(f"  Platform:  {s.get('platform','?')}")
-            print(f"  WS:        {'🟢 Connected' if s.get('ws_connected') else '🔴 Disconnected'}")
-            print(f"  Messages:  {s.get('messages_sent',0)} sent")
-            print(f"  Reconnects:{s.get('ws_reconnects',0)}")
+            print(f"  Node:       {s.get('node_name','?')} ({s.get('config',{}).get('node_id','?')})")
+            print(f"  Platform:   {s.get('platform','?')}")
+            print(f"  Tailscale:  {ts_ip or '⚠️  not detected'}")
+            print(f"  WS:         {'🟢 Connected' if s.get('ws_connected') else '🔴 Disconnected'}")
+            print(f"  Messages:   {s.get('messages_sent',0)} sent")
+            print(f"  Reconnects: {s.get('ws_reconnects',0)}")
+            peers = s.get("mesh_peers", [])
+            if peers:
+                print(f"  Mesh peers: {len(peers)}")
+                for p in peers:
+                    status = "🟢" if p.get("ws_connected") else "🔴"
+                    print(f"    {status} {p['node_name']} ({p.get('tailscale_ip','no-ts')}) v{p.get('version','?')}")
             last = s.get("last_message")
             if last:
-                print(f"  Last msg:  [{last['platform']}] {last['from']} @ {last['time']}")
-            print(f"  Started:   {s.get('started_at','?')}")
-            print(f"{'─'*50}\n")
+                print(f"  Last msg:   [{last['platform']}] {last['from']} @ {last['time']}")
+            print(f"  Started:    {s.get('started_at','?')}")
+            print(f"{'─'*54}\n")
         except Exception:
             print("❌ Daemon not running (or health API unreachable)")
-            print(f"   Start with: beeperd run")
+            print("   Start with: beeperd run")
 
     elif args.cmd == "logs":
         if LOG_FILE.exists():
             subprocess.run(["tail", "-f", str(LOG_FILE)])
         else:
             print("No log file found")
+
+    elif args.cmd == "mesh":
+        try:
+            import requests
+            r = requests.get(f"http://localhost:{HEALTH_PORT}/mesh", timeout=3)
+            data = r.json()
+            ts_ip = data.get("tailscale_ip")
+            peers = data.get("peers", [])
+            print(f"\n{'─'*54}")
+            print(f"  🕸️  GARZA Beeper Mesh")
+            print(f"  This node: {data.get('node_name')} ({ts_ip or 'no tailscale'})")
+            if peers:
+                print(f"  Peers ({len(peers)}):")
+                for p in peers:
+                    status = "🟢" if p.get("ws_connected") else "🔴"
+                    ts = p.get("tailscale_ip", "no-ts")
+                    print(f"    {status} {p['node_name']} — {ts} — v{p.get('version','?')} — {p.get('messages_sent',0)} msgs")
+            else:
+                print("  No other mesh nodes detected.")
+                print("  Install garza-beeperd on another machine to join the mesh.")
+            print(f"{'─'*54}\n")
+        except Exception:
+            print("❌ Daemon not running")
 
     elif args.cmd == "stop":
         if PID_FILE.exists():
@@ -768,7 +964,10 @@ def main():
             else:
                 print("No LaunchAgent found")
         elif system == "Linux":
-            subprocess.run(["systemctl", "--user", "disable", "--now", "garza-beeperd"], capture_output=True)
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", "garza-beeperd"],
+                capture_output=True
+            )
             svc = Path.home() / ".config" / "systemd" / "user" / "garza-beeperd.service"
             if svc.exists():
                 svc.unlink()
