@@ -73,6 +73,10 @@ if [ -z "$PYTHON" ]; then
     fi
 fi
 
+# ── Create install directory ──────────────────────────────────────────────────
+mkdir -p "${INSTALL_DIR}"
+mkdir -p "${BIN_DIR}"
+
 # ── Create venv (avoids Homebrew externally-managed-environment error) ────────
 VENV_DIR="${INSTALL_DIR}/venv"
 if [ ! -d "${VENV_DIR}" ]; then
@@ -89,10 +93,6 @@ VENV_PIP="${VENV_DIR}/bin/pip"
 info "Installing Python dependencies..."
 "$VENV_PIP" install --quiet --upgrade websocket-client requests
 success "Dependencies installed"
-
-# ── Create install directory ──────────────────────────────────────────────────
-mkdir -p "${INSTALL_DIR}"
-mkdir -p "${BIN_DIR}"
 
 # ── Download daemon script ────────────────────────────────────────────────────
 info "Downloading garza-beeperd..."
